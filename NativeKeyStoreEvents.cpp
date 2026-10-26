@@ -1,32 +1,287 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// AppleKeyStore for an ephemeral offline fixture: a notification service (the public IOKit matching class used by
-// MKBEventsRegister) and, only when sheng-aks=1 is set, a user client that answers the state queries of the unchanged
-// libaks/MobileKeyBag truthfully for this environment: no keybag, no passcode, nothing locked. It provides no key,
-// keybag, passcode or data-protection operation; every other selector fails with kIOReturnError exactly as an unreachable
-// AppleKeyStore does. It protects nothing and must not be taken for secure storage.
-//
-// Answers (selectors and layouts read from the unchanged target's libaks/MobileKeyBag, see docs/touch-nt36532e.md; the set that is
-// enough for the system daemons on iOS 16.7 was established on hardware by github.com/dipa-studio/ios-sweet, whose notes document it):
-//   0, 4, 5, 9, 12, 13, 26, 27, 55, 101, 102   succeed, no outputs (open handshake, bag/assertion/notify bookkeeping)
-//   14       aks_get_system                        scalar out: system keybag handle 0 (keybagd then needs no systembag.kb)
-//   7        aks_get_lock_state(device)            scalar out: bit 2 = unlocked since boot
-//   17, 35   aks_get_(extended_)device_state       struct out: DER SET{ SEQUENCE{ UTF8String key, INTEGER value } ... }
-//            keys ss sls sb sfa sgs sas sgpe srcd sms bh; ss = 4, sls = lock state (0 unlocked; 3 would be "no passcode").
+// AppleKeyStore supplies the unchanged iPadOS 17.7.11 libaks state interface and
+// software wrapping of ordinary keychain keys. The platform supplies a private,
+// persistent 256-bit root key. securityd owns the keychain database and stores
+// the wrapped keys there. The root key has no hardware isolation or passcode
+// protection; the service remains unlocked and supports no Secure Enclave keys.
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
+#include <libkern/c++/OSBoolean.h>
+#include <libkern/crypto/aes.h>
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wextern-c-compat"
+#include <libkern/crypto/crypto_internal.h>
+#pragma clang diagnostic pop
+#include <corecrypto/cc.h>
 extern "C" void native_keyevents_open_refused(void);
 extern "C" bool native_aks_state_enabled(void);
 extern "C" uint32_t native_aks_lock_state(void);
 extern "C" void native_aks_call(uint32_t selector, int32_t result);
 extern "C" void native_aks_opened(void);
 
+// Platforms without a persistent private key retain the state-only interface.
+extern "C" __attribute__((weak)) bool native_aks_copy_software_key(uint8_t *, size_t) {
+    return false;
+}
+
 namespace {
 constexpr uint32_t kSelLockState = 7, kSelGetSystem = 14, kSelDeviceState = 17, kSelExtendedDeviceState = 35;
+constexpr uint32_t kSelWrapKey = 10;
+constexpr uint32_t kSelUnwrapKey = 11;
+constexpr uint32_t kSelBagUUID = 23;
+constexpr uint32_t kSelGeneration = 40;
 constexpr uint64_t kUnlockedSinceBoot = 4;
 constexpr uint32_t kStateFlags = 4;
 constexpr uint64_t kSystemHandle = 0;
+constexpr size_t kRootKeyBytes = 32;
+constexpr size_t kMaximumKeyBytes = 128;
+constexpr size_t kWrapOverhead = 8;
 constexpr IOReturn kAksError = (IOReturn)0xe00002bc;   // what libaks reports itself when the connection is missing
 constexpr IOReturn kAksUnsupported = (IOReturn)0xe00002c7;
+
+bool cryptoAvailable() {
+    return g_crypto_funcs && g_crypto_funcs->ccaes_cbc_encrypt &&
+        g_crypto_funcs->ccaes_cbc_decrypt && g_crypto_funcs->cchmac_fn &&
+        g_crypto_funcs->ccsha256_di;
+}
+
+bool softwareKeyAvailable() {
+    uint8_t key[kRootKeyBytes];
+    bool available = cryptoAvailable() && native_aks_copy_software_key(key, sizeof(key));
+    cc_clear(sizeof(key), key);
+
+    return available;
+}
+
+void storeBigEndian32(uint8_t *out, uint32_t value) {
+    for (unsigned index = 0; index < sizeof(value); ++index) {
+        out[index] = static_cast<uint8_t>(value >> (24 - index * 8));
+    }
+}
+
+// Each purpose and key class receives a separate HMAC-SHA256-derived AES key.
+bool deriveSoftwareKey(const char *purpose, size_t purposeLength,
+                       uint32_t keyClass, uint8_t out[kRootKeyBytes]) {
+    uint8_t root[kRootKeyBytes];
+    uint8_t input[64];
+    if (!cryptoAvailable() || purposeLength > sizeof(input) - 8 ||
+        !native_aks_copy_software_key(root, sizeof(root))) {
+        cc_clear(sizeof(root), root);
+        return false;
+    }
+
+    memcpy(input, purpose, purposeLength);
+    storeBigEndian32(input + purposeLength, static_cast<uint32_t>(kSystemHandle));
+    storeBigEndian32(input + purposeLength + 4, keyClass);
+    g_crypto_funcs->cchmac_fn(g_crypto_funcs->ccsha256_di, sizeof(root), root,
+        purposeLength + 8, input, out);
+    cc_clear(sizeof(root), root);
+    cc_clear(sizeof(input), input);
+
+    return true;
+}
+
+bool hasOutputCapacity(const IOExternalMethodArguments *args, size_t length) {
+    if (args->structureOutputDescriptor) {
+        return length <= args->structureOutputDescriptor->getLength();
+    }
+
+    return args->structureOutput && length <= args->structureOutputSize;
+}
+
+IOReturn writeOutput(IOExternalMethodArguments *args, const uint8_t *bytes, size_t length) {
+    if (!hasOutputCapacity(args, length)) {
+        return kIOReturnNoSpace;
+    }
+
+    if (args->structureOutputDescriptor) {
+        if (args->structureOutputDescriptor->writeBytes(0, bytes, length) != length) {
+            return kIOReturnIOError;
+        }
+        args->structureOutputDescriptorSize = length;
+    } else {
+        memcpy(args->structureOutput, bytes, length);
+        args->structureOutputSize = static_cast<uint32_t>(length);
+    }
+
+    return kIOReturnSuccess;
+}
+
+size_t inputLength(const IOExternalMethodArguments *args) {
+    if (args->structureInputDescriptor) {
+        return args->structureInputDescriptor->getLength();
+    }
+
+    return args->structureInputSize;
+}
+
+bool readInput(const IOExternalMethodArguments *args, uint8_t *bytes, size_t length) {
+    if (args->structureInputDescriptor) {
+        return args->structureInputDescriptor->readBytes(0, bytes, length) == length;
+    }
+    if (!args->structureInput) {
+        return false;
+    }
+
+    memcpy(bytes, args->structureInput, length);
+
+    return true;
+}
+
+// RFC 3394 stores [eight-byte integrity value, encrypted eight-byte key parts].
+// The AES helpers apply one ECB block using the registered software CBC mode.
+IOReturn wrapKey(const uint8_t key[kRootKeyBytes], const uint8_t *input,
+                 size_t length, uint8_t *output) {
+    aes_encrypt_ctx context;
+    uint8_t block[16];
+    uint8_t encrypted[16];
+    memset(output, 0xa6, kWrapOverhead);
+    memcpy(output + kWrapOverhead, input, length);
+    int result = aes_encrypt_key(key, kRootKeyBytes, &context);
+    size_t parts = length / kWrapOverhead;
+
+    for (unsigned round = 0; round < 6 && !result; ++round) {
+        for (size_t part = 1; part <= parts; ++part) {
+            memcpy(block, output, kWrapOverhead);
+            memcpy(block + kWrapOverhead, output + part * kWrapOverhead, kWrapOverhead);
+            result = aes_encrypt(block, encrypted, &context);
+            if (result) {
+                break;
+            }
+
+            uint64_t counter = parts * round + part;
+            for (unsigned index = 0; index < kWrapOverhead; ++index) {
+                output[index] = encrypted[index] ^
+                    static_cast<uint8_t>(counter >> (56 - index * 8));
+            }
+            memcpy(output + part * kWrapOverhead, encrypted + kWrapOverhead, kWrapOverhead);
+        }
+    }
+
+    cc_clear(sizeof(context), &context);
+    cc_clear(sizeof(block), block);
+    cc_clear(sizeof(encrypted), encrypted);
+
+    return result ? kAksError : kIOReturnSuccess;
+}
+
+IOReturn unwrapKey(const uint8_t key[kRootKeyBytes], const uint8_t *input,
+                   size_t length, uint8_t *output) {
+    aes_decrypt_ctx context;
+    uint8_t accumulator[kWrapOverhead];
+    uint8_t block[16];
+    uint8_t decrypted[16];
+    memcpy(accumulator, input, sizeof(accumulator));
+    memcpy(output, input + kWrapOverhead, length - kWrapOverhead);
+    int result = aes_decrypt_key(key, kRootKeyBytes, &context);
+    size_t parts = length / kWrapOverhead - 1;
+
+    for (int round = 5; round >= 0 && !result; --round) {
+        for (size_t part = parts; part > 0; --part) {
+            uint64_t counter = parts * static_cast<unsigned>(round) + part;
+            for (unsigned index = 0; index < kWrapOverhead; ++index) {
+                block[index] = accumulator[index] ^
+                    static_cast<uint8_t>(counter >> (56 - index * 8));
+            }
+            memcpy(block + kWrapOverhead, output + (part - 1) * kWrapOverhead, kWrapOverhead);
+            result = aes_decrypt(block, decrypted, &context);
+            if (result) {
+                break;
+            }
+
+            memcpy(accumulator, decrypted, sizeof(accumulator));
+            memcpy(output + (part - 1) * kWrapOverhead, decrypted + kWrapOverhead, kWrapOverhead);
+        }
+    }
+
+    uint8_t difference = 0;
+    for (uint8_t byte : accumulator) {
+        difference |= byte ^ 0xa6;
+    }
+
+    cc_clear(sizeof(context), &context);
+    cc_clear(sizeof(accumulator), accumulator);
+    cc_clear(sizeof(block), block);
+    cc_clear(sizeof(decrypted), decrypted);
+
+    return result || difference ? kAksError : kIOReturnSuccess;
+}
+
+IOReturn cryptKey(uint32_t selector, IOExternalMethodArguments *args) {
+    bool wrapping = selector == kSelWrapKey;
+    if (args->scalarInputCount != 2 || !args->scalarInput ||
+        args->scalarInput[0] != kSystemHandle ||
+        args->scalarOutputCount != (wrapping ? 1u : 0u) ||
+        (wrapping && !args->scalarOutput)) {
+        return kIOReturnBadArgument;
+    }
+
+    // Classes 1 through 11 cover file and ordinary keychain keys. Class 12
+    // requires a passcode, which this permanently unlocked service cannot bind.
+    uint64_t keyClass = args->scalarInput[1];
+    if (keyClass == 0 || keyClass > 11) {
+        return kAksUnsupported;
+    }
+
+    size_t length = inputLength(args);
+    size_t minimum = wrapping ? 16 : 16 + kWrapOverhead;
+    size_t maximum = wrapping ? kMaximumKeyBytes : kMaximumKeyBytes + kWrapOverhead;
+    if (length < minimum || length > maximum || (length % kWrapOverhead) != 0) {
+        return kIOReturnBadArgument;
+    }
+
+    size_t outputLength = wrapping ? length + kWrapOverhead : length - kWrapOverhead;
+    if (!hasOutputCapacity(args, outputLength)) {
+        return kIOReturnNoSpace;
+    }
+
+    uint8_t key[kRootKeyBytes];
+    static constexpr char purpose[] = "UniXNU AppleKeyStore software key v1";
+    if (!deriveSoftwareKey(purpose, sizeof(purpose), static_cast<uint32_t>(keyClass), key)) {
+        return kIOReturnNotReady;
+    }
+
+    uint8_t input[kMaximumKeyBytes + kWrapOverhead];
+    uint8_t output[kMaximumKeyBytes + kWrapOverhead];
+    IOReturn result = kIOReturnBadArgument;
+    if (readInput(args, input, length)) {
+        result = wrapping ? wrapKey(key, input, length, output) :
+            unwrapKey(key, input, length, output);
+        if (result == kIOReturnSuccess) {
+            result = writeOutput(args, output, outputLength);
+        }
+    }
+
+    if (result == kIOReturnSuccess && wrapping) {
+        args->scalarOutput[0] = keyClass;
+        args->scalarOutputCount = 1;
+    }
+    cc_clear(sizeof(key), key);
+    cc_clear(sizeof(input), input);
+    cc_clear(sizeof(output), output);
+
+    return result;
+}
+
+IOReturn bagUUID(IOExternalMethodArguments *args) {
+    if (args->scalarInputCount != 1 || !args->scalarInput ||
+        args->scalarInput[0] != kSystemHandle || args->scalarOutputCount != 0) {
+        return kIOReturnBadArgument;
+    }
+
+    uint8_t key[kRootKeyBytes];
+    static constexpr char purpose[] = "UniXNU AppleKeyStore bag uuid v1";
+    if (!deriveSoftwareKey(purpose, sizeof(purpose), 0, key)) {
+        return kIOReturnNotReady;
+    }
+
+    key[6] = (key[6] & 0x0f) | 0x40;
+    key[8] = (key[8] & 0x3f) | 0x80;
+    IOReturn result = writeOutput(args, key, 16);
+    cc_clear(sizeof(key), key);
+
+    return result;
+}
 
 struct DerWriter {
     uint8_t *p; size_t cap, n = 0; bool ok = true;
@@ -70,9 +325,20 @@ extern "C" size_t native_aks_encode_state(uint8_t *out, size_t capacity, uint32_
     return w.ok ? w.n : 0;
 }
 
+// AppleKeyStoreUserClient accepts the original libaks scalar and structure
+// layouts. securityd persists wrapped keys; unwrapping releases plaintext only
+// after the RFC 3394 integrity value has been checked.
 class AppleKeyStoreUserClient final : public IOUserClient {
     OSDeclareDefaultStructors(AppleKeyStoreUserClient)
+    bool keyOperationsAllowed = false;
 public:
+    void configureKeyAccess(task_t task) {
+        OSObject *entitlement = IOUserClient::copyClientEntitlement(
+            task, "com.apple.keystore.access-keychain-keys");
+        keyOperationsAllowed = entitlement == kOSBooleanTrue;
+        OSSafeReleaseNULL(entitlement);
+    }
+
     IOReturn clientClose() override { terminate(); return kIOReturnSuccess; }
     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *,
                             OSObject *, void *) override {
@@ -80,9 +346,27 @@ public:
         if (!args) rc = kAksError;
         else switch (selector) {
         // Handshake right after IOServiceOpen (a failure makes libaks drop the connection and reopen on every call), and the
-        // bag/assertion/notification calls that need no answer in an environment without keybags.
+        // assertion and notification calls retain the permanently unlocked state.
         case 0: case 4: case 5: case 9: case 12: case 13: case 26: case 27: case 55: case 101: case 102:
             args->scalarOutputCount = 0;
+            rc = kIOReturnSuccess;
+            break;
+        case kSelWrapKey:
+        case kSelUnwrapKey:
+            rc = keyOperationsAllowed ? cryptKey(selector, args) : kIOReturnNotPrivileged;
+            break;
+        case kSelBagUUID:
+            rc = bagUUID(args);
+            break;
+        case kSelGeneration:
+            if (args->scalarInputCount != 2 || !args->scalarInput ||
+                args->scalarInput[0] != kSystemHandle || args->scalarInput[1] != 0 ||
+                args->scalarOutputCount != 1 || !args->scalarOutput) {
+                rc = kIOReturnBadArgument;
+                break;
+            }
+            args->scalarOutput[0] = 0;
+            args->scalarOutputCount = 1;
             rc = kIOReturnSuccess;
             break;
         case kSelGetSystem:
@@ -124,6 +408,8 @@ public:
 };
 OSDefineMetaClassAndStructors(AppleKeyStoreUserClient, IOUserClient)
 
+// AppleKeyStore publishes the original service name and software key wrapping
+// availability. Board registration owns the private root key and service start.
 class AppleKeyStore final : public IOService {
     OSDeclareDefaultStructors(AppleKeyStore)
     IOReturn open(task_t task, void *security, UInt32 type, OSDictionary *properties, IOUserClient **out) {
@@ -134,6 +420,7 @@ class AppleKeyStore final : public IOService {
         if (!client->initWithTask(task, security, type, properties) || !client->attach(this)) {
             client->release(); return kIOReturnError;
         }
+        client->configureKeyAccess(task);
         if (!client->start(this)) { client->detach(this); client->release(); return kIOReturnError; }
         native_aks_opened();
         *out = client;
@@ -142,9 +429,12 @@ class AppleKeyStore final : public IOService {
 public:
     bool start(IOService *provider) override {
         if (!IOService::start(provider)) return false;
-        setName("Native keystore state service");
+        bool softwareKeys = softwareKeyAvailable();
+        setName("Native software keystore service");
         if (!setProperty("NativeKeyStoreEvents", true) ||
-            !setProperty("KeyOperationsAvailable", false)) {
+            !setProperty("KeyOperationsAvailable", softwareKeys) ||
+            !setProperty("SoftwareKeyWrapping", softwareKeys) ||
+            !setProperty("HardwareKeyIsolation", false)) {
             IOService::stop(provider);
             return false;
         }
